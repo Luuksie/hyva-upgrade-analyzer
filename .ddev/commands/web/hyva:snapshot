@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+
+## Description: Snapshot current Hyvä vendor files before an upgrade (run before composer update)
+## Usage: hyva:snapshot [--output=.hyva-snapshot.json] [--patterns=hyva-themes/*]
+## Example: ddev hyva:snapshot
+## Example: ddev hyva:snapshot --output=.hyva-snapshot-1.3.7.json
+
+php "${DDEV_APPROOT}/bin/hyva-upgrade-analyzer" snapshot "$@"

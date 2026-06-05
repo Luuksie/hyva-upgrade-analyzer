@@ -1,0 +1,7 @@
+name: hyva-upgrade-analyzer
+project_files:
+  - bin/hyva-upgrade-analyzer
+  - .ddev/commands/web/hyva:snapshot
+  - .ddev/commands/web/hyva:check
+post_install_actions:
+  - chmod +x "${DDEV_APPROOT}/bin/hyva-upgrade-analyzer"

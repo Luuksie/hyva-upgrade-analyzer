@@ -1,0 +1,1315 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+namespace HyvaUpgradeAnalyzer;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CliApplication
+// ─────────────────────────────────────────────────────────────────────────────
+
+class CliApplication
+{
+    public function __construct(private readonly string $rootDir) {}
+
+    public function run(array $argv): never
+    {
+        $command = $argv[1] ?? '--help';
+        $opts    = $this->parseOptions(array_slice($argv, 2));
+
+        if ($command === 'snapshot') {
+            $this->runSnapshot($opts);
+            exit(0);
+        }
+
+        if ($command === 'analyze') {
+            $this->runAnalyze($opts);
+            exit(0);
+        }
+
+        if (in_array($command, ['--help', '-h', 'help'], true)) {
+            $this->printUsage();
+        }
+
+        $this->error("Unknown command: {$command}");
+    }
+
+    private function resolvePath(string $path): string
+    {
+        return str_starts_with($path, '/') ? $path : $this->rootDir . '/' . $path;
+    }
+
+    private function parseOptions(array $args): array
+    {
+        $opts = [];
+        foreach ($args as $arg) {
+            if (!str_starts_with($arg, '--')) {
+                continue;
+            }
+            $arg = substr($arg, 2);
+            if (str_contains($arg, '=')) {
+                [$key, $value] = explode('=', $arg, 2);
+                $opts[$key] = $value;
+            } else {
+                $opts[$arg] = true;
+            }
+        }
+        return $opts;
+    }
+
+    private function runSnapshot(array $opts): void
+    {
+        $vendorDir  = $this->resolvePath($opts['vendor-dir'] ?? 'vendor');
+        $outputPath = $this->resolvePath($opts['output'] ?? '.hyva-snapshot.json');
+        $patterns   = isset($opts['patterns']) ? explode(',', $opts['patterns']) : ['hyva-themes/*'];
+
+        $this->stderr("Scanning Hyvä packages in {$vendorDir}...");
+
+        $scanner  = new HyvaModuleScanner($vendorDir);
+        $packages = $scanner->discoverPackages($patterns);
+
+        if (empty($packages)) {
+            $this->stderr("No Hyvä packages found. Check --patterns or verify Hyvä is installed.");
+            return;
+        }
+
+        $this->stderr("Found " . count($packages) . " Hyvä package(s).");
+
+        $snapshot = [
+            'version'    => '1.0',
+            'created_at' => date('c'),
+            'vendor_dir' => $vendorDir,
+            'packages'   => [],
+        ];
+
+        foreach ($packages as $pkg) {
+            $this->stderr("  Scanning {$pkg['name']} ({$pkg['version']})...");
+            $files = $scanner->scanPackage($pkg);
+            $snapshot['packages'][$pkg['name']] = array_merge($pkg, ['files' => $files]);
+        }
+
+        $snapshot['override_index'] = SnapshotManager::buildOverrideIndex($snapshot['packages']);
+
+        $manager = new SnapshotManager($this->rootDir);
+        $manager->save($snapshot, $outputPath);
+
+        $totalFiles = array_sum(array_map(fn($p) => count($p['files']), $snapshot['packages']));
+        $this->stderr("Snapshot saved to {$outputPath} ({$totalFiles} files indexed).");
+    }
+
+    private function runAnalyze(array $opts): void
+    {
+        $vendorDir     = $this->resolvePath($opts['vendor-dir'] ?? 'vendor');
+        $themeDir      = $this->resolvePath($opts['theme-dir'] ?? 'app/design/frontend');
+        $snapPath      = $this->resolvePath($opts['snapshot'] ?? '.hyva-snapshot.json');
+        $outputPath    = $this->resolvePath($opts['output'] ?? 'hyva-upgrade-report.md');
+        $excludeVendor = (string) ($opts['exclude-vendor'] ?? 'Magento');
+        $patterns      = isset($opts['patterns']) ? explode(',', $opts['patterns']) : ['hyva-themes/*'];
+
+        $manager = new SnapshotManager($this->rootDir);
+        $this->stderr("Loading snapshot from {$snapPath}...");
+        $oldSnapshot = $manager->load($snapPath);
+
+        $this->stderr("Scanning current Hyvä packages...");
+        $scanner  = new HyvaModuleScanner($vendorDir);
+        $packages = $scanner->discoverPackages($patterns);
+
+        $newSnapshot = [
+            'version'    => '1.0',
+            'created_at' => date('c'),
+            'vendor_dir' => $vendorDir,
+            'packages'   => [],
+        ];
+
+        foreach ($packages as $pkg) {
+            $this->stderr("  Scanning {$pkg['name']}...");
+            $files = $scanner->scanPackage($pkg);
+            $newSnapshot['packages'][$pkg['name']] = array_merge($pkg, ['files' => $files]);
+        }
+
+        $newSnapshot['override_index'] = SnapshotManager::buildOverrideIndex($newSnapshot['packages']);
+
+        $this->stderr("Detecting changes...");
+        $detector = new ChangeDetector();
+        $changes  = $detector->diff($oldSnapshot, $newSnapshot);
+
+        $this->stderr("Classifying risks...");
+        $classifier       = new RiskClassifier();
+        $classifiedChanges = [];
+        foreach ($changes as $pkgName => $pkgChanges) {
+            foreach ($pkgChanges as $relPath => $change) {
+                $change['risk']               = $classifier->classify($change, $relPath);
+                $classifiedChanges[$pkgName][$relPath] = $change;
+            }
+        }
+
+        $this->stderr("Mapping theme overrides...");
+        $overrideMapper = new OverrideMapper($themeDir, $excludeVendor);
+        $themes         = $overrideMapper->discoverThemes();
+        $overrides      = $overrideMapper->mapOverrides($themes, $newSnapshot['override_index'], $classifiedChanges);
+
+        $this->stderr("Analyzing cross-module interactions...");
+        $crossAnalyzer = new CrossModuleAnalyzer();
+        $crossRisks    = $crossAnalyzer->analyze($newSnapshot['packages'], $classifiedChanges);
+
+        $this->stderr("Generating report...");
+        $generator = new ReportGenerator();
+        $report    = $generator->generate([
+            'old_packages'     => $oldSnapshot['packages'] ?? [],
+            'new_packages'     => $newSnapshot['packages'],
+            'changes'          => $classifiedChanges,
+            'overrides'        => $overrides,
+            'cross_risks'      => $crossRisks,
+            'generated_at'     => date('c'),
+            'snapshot_created' => $oldSnapshot['created_at'] ?? 'unknown',
+        ]);
+
+        file_put_contents($outputPath, $report);
+        $this->stderr("Report written to {$outputPath}");
+
+        // Exit 1 if any critical issues found
+        foreach ($classifiedChanges as $pkgChanges) {
+            foreach ($pkgChanges as $change) {
+                if (($change['risk'] ?? '') === 'critical') {
+                    $this->stderr("CRITICAL issues found — exit code 1.");
+                    exit(1);
+                }
+            }
+        }
+    }
+
+    private function printUsage(): never
+    {
+        echo <<<'HELPTEXT'
+Hyvä Upgrade Impact Analyzer
+
+USAGE:
+  php bin/hyva-upgrade-analyzer snapshot [options]
+  php bin/hyva-upgrade-analyzer analyze  [options]
+
+SNAPSHOT OPTIONS (run before composer update):
+  --vendor-dir=vendor             Path to vendor directory (default: vendor)
+  --output=.hyva-snapshot.json    Output snapshot file (default: .hyva-snapshot.json)
+  --patterns=hyva-themes/*        Comma-separated package name patterns (default: hyva-themes/*)
+
+ANALYZE OPTIONS (run after composer update):
+  --vendor-dir=vendor             Path to vendor directory (default: vendor)
+  --theme-dir=app/design/frontend Path to custom themes (default: app/design/frontend)
+  --snapshot=.hyva-snapshot.json  Snapshot file from before upgrade (default: .hyva-snapshot.json)
+  --output=hyva-upgrade-report.md Output report file (default: hyva-upgrade-report.md)
+  --exclude-vendor=Magento        Theme vendor directory to exclude (default: Magento)
+  --patterns=hyva-themes/*        Comma-separated package name patterns (default: hyva-themes/*)
+
+EXIT CODES:
+  0 = Success / no critical issues
+  1 = Critical issues found or fatal error
+
+WORKFLOW:
+  # Step 1 — before upgrade:
+  php bin/hyva-upgrade-analyzer snapshot
+
+  # Step 2 — upgrade Hyvä:
+  composer update 'hyva-themes/*'
+
+  # Step 3 — after upgrade:
+  php bin/hyva-upgrade-analyzer analyze
+
+HELPTEXT;
+        exit(0);
+    }
+
+    private function stderr(string $msg): void
+    {
+        fwrite(STDERR, $msg . "\n");
+    }
+
+    private function error(string $msg): never
+    {
+        fwrite(STDERR, "Error: {$msg}\n");
+        fwrite(STDERR, "Run with --help for usage.\n");
+        exit(1);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HyvaModuleScanner
+// ─────────────────────────────────────────────────────────────────────────────
+
+class HyvaModuleScanner
+{
+    private const ALPINE_DIRECTIVE_PATTERNS = [
+        '/\bx-data\s*=/i',
+        '/\bx-init\s*=/i',
+        '/\bx-show\s*=/i',
+        '/\bx-if\s*=/i',
+        '/\bx-for\s*=/i',
+        '/\bx-model\s*=/i',
+        '/\bx-effect\s*=/i',
+        '/\bx-on:/i',
+        '/\bx-bind:/i',
+        '/@click\b/i',
+        '/@change\b/i',
+        '/@submit\b/i',
+        '/@keydown\b/i',
+        '/@input\b/i',
+        '/\bx-cloak\b/i',
+        '/\bx-ref\s*=/i',
+        '/\bx-html\s*=/i',
+        '/\bx-text\s*=/i',
+        '/\bx-transition\b/i',
+        '/\bx-spread\s*=/i',
+    ];
+
+    private const ALPINE_API_PATTERNS = [
+        '/Alpine\.store\s*\(/i',
+        '/Alpine\.data\s*\(/i',
+        '/Alpine\.magic\s*\(/i',
+        '/Alpine\.directive\s*\(/i',
+        '/Alpine\.plugin\s*\(/i',
+        '/Alpine\.start\s*\(/i',
+    ];
+
+    // Quote-anchored to avoid PHP variable false positives in .phtml files
+    private const ALPINE_MAGIC_TEMPLATE_PATTERNS = [
+        '/["\'\`]\s*\$store\./i',
+        '/["\'\`]\s*\$dispatch\b/i',
+        '/["\'\`]\s*\$nextTick\b/i',
+        '/["\'\`]\s*\$watch\b/i',
+        '/["\'\`]\s*\$refs\b/i',
+        '/["\'\`]\s*\$el\b/i',
+        '/["\'\`]\s*\$root\b/i',
+        '/["\'\`]\s*\$data\b/i',
+    ];
+
+    // Unanchored — safe in pure JS context
+    private const ALPINE_MAGIC_JS_PATTERNS = [
+        '/\$store\./i',
+        '/\$dispatch\b/i',
+        '/\$nextTick\b/i',
+        '/\$watch\b/i',
+        '/\$refs\b/i',
+        '/\$el\b/i',
+    ];
+
+    public function __construct(private readonly string $vendorDir) {}
+
+    public function discoverPackages(array $patterns = ['hyva-themes/*']): array
+    {
+        $installedJson = $this->vendorDir . '/composer/installed.json';
+        if (!file_exists($installedJson)) {
+            return [];
+        }
+
+        $installed = json_decode(file_get_contents($installedJson), true);
+        // installed.json can be `{packages: [...]}` or just `[...]`
+        $pkgList = $installed['packages'] ?? $installed;
+
+        $result = [];
+        foreach ($pkgList as $pkg) {
+            $name = $pkg['name'] ?? '';
+            if (!$this->matchesAnyPattern($name, $patterns)) {
+                continue;
+            }
+
+            $installPath = $pkg['install-path'] ?? null;
+            if ($installPath === null) {
+                continue; // metapackage
+            }
+
+            // install-path is relative to vendor/composer/
+            $absPath = realpath($this->vendorDir . '/composer/' . $installPath);
+            if ($absPath === false || !is_dir($absPath)) {
+                continue;
+            }
+
+            $result[] = [
+                'name'         => $name,
+                'version'      => $pkg['version'] ?? 'unknown',
+                'type'         => $pkg['type'] ?? 'library',
+                'install_path' => $absPath,
+                'rel_path'     => 'vendor/' . $name,
+            ];
+        }
+
+        return $result;
+    }
+
+    private function matchesAnyPattern(string $name, array $patterns): bool
+    {
+        foreach ($patterns as $pattern) {
+            if (fnmatch(trim($pattern), $name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public function scanPackage(array $packageInfo): array
+    {
+        $files    = [];
+        $basePath = $packageInfo['install_path'];
+
+        if (!is_dir($basePath)) {
+            return $files;
+        }
+
+        $iterator = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator(
+                $basePath,
+                \RecursiveDirectoryIterator::SKIP_DOTS | \RecursiveDirectoryIterator::FOLLOW_SYMLINKS
+            )
+        );
+
+        foreach ($iterator as $file) {
+            if (!$file->isFile()) {
+                continue;
+            }
+
+            $absPath = $file->getRealPath();
+            $relPath = ltrim(str_replace($basePath, '', $absPath), '/\\');
+
+            $files[$relPath] = $this->computeFileEntry($absPath, $relPath);
+        }
+
+        return $files;
+    }
+
+    public function computeFileEntry(string $absPath, string $relPath): array
+    {
+        $category = $this->categorizeFile($relPath);
+        $hash     = sha1_file($absPath);
+        $content  = (string) file_get_contents($absPath);
+
+        return [
+            'hash'           => $hash,
+            'content_hash'   => sha1($this->stripCommentsAndNormalize($content)),
+            'size'           => filesize($absPath),
+            'category'       => $category,
+            'has_alpine'     => $this->detectAlpinePatterns($content, $category),
+            'stores_defined' => $this->extractStoreDefined($content),
+            'stores_used'    => $this->extractStoreUsed($content),
+        ];
+    }
+
+    public function categorizeFile(string $relPath): string
+    {
+        $ext = strtolower(pathinfo($relPath, PATHINFO_EXTENSION));
+
+        return match (true) {
+            in_array($ext, ['phtml', 'html'], true)                          => 'template',
+            in_array($ext, ['js', 'ts'], true)                               => 'js',
+            in_array($ext, ['css', 'less'], true)                            => 'css',
+            $ext === 'xml' && str_contains($relPath, '/layout/')             => 'layout',
+            $ext === 'xml'                                                    => 'xml',
+            $ext === 'php'                                                    => 'php',
+            default                                                           => 'other',
+        };
+    }
+
+    public function detectAlpinePatterns(string $content, string $category): bool
+    {
+        $patterns = array_merge(self::ALPINE_DIRECTIVE_PATTERNS, self::ALPINE_API_PATTERNS);
+
+        if ($category !== 'php') {
+            $patterns = array_merge($patterns, self::ALPINE_MAGIC_TEMPLATE_PATTERNS);
+        }
+
+        if (in_array($category, ['js', 'ts'], true)) {
+            $patterns = array_merge($patterns, self::ALPINE_MAGIC_JS_PATTERNS);
+        }
+
+        foreach ($patterns as $pattern) {
+            if (preg_match($pattern, $content)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public function extractStoreDefined(string $content): array
+    {
+        preg_match_all('/Alpine\.store\s*\(\s*[\'\"]([\w]+)[\'\"]/i', $content, $m);
+        return array_values(array_unique($m[1] ?? []));
+    }
+
+    public function extractStoreUsed(string $content): array
+    {
+        preg_match_all('/\$store\.([\w]+)/i', $content, $m);
+        return array_values(array_unique($m[1] ?? []));
+    }
+
+    private function stripCommentsAndNormalize(string $content): string
+    {
+        $content = preg_replace('/<!--.*?-->/s', '', $content) ?? $content;
+        $content = preg_replace('/\/\*.*?\*\//s', '', $content) ?? $content;
+        $content = preg_replace('/(?<!:)\/\/[^\n]*/m', '', $content) ?? $content;
+        $content = preg_replace('/\s+/', ' ', $content) ?? $content;
+        return trim($content);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SnapshotManager
+// ─────────────────────────────────────────────────────────────────────────────
+
+class SnapshotManager
+{
+    public function __construct(private readonly string $rootDir) {}
+
+    public function save(array $snapshot, string $outputPath): void
+    {
+        $json = json_encode($snapshot, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        if (file_put_contents($outputPath, $json) === false) {
+            throw new \RuntimeException("Failed to write snapshot to {$outputPath}");
+        }
+    }
+
+    public function load(string $snapshotPath): array
+    {
+        if (!file_exists($snapshotPath)) {
+            throw new \RuntimeException(
+                "Snapshot not found: {$snapshotPath}\n" .
+                "Run 'php bin/hyva-upgrade-analyzer snapshot' before upgrading."
+            );
+        }
+
+        $snapshot = json_decode((string) file_get_contents($snapshotPath), true);
+
+        if (!is_array($snapshot) || !isset($snapshot['version'])) {
+            throw new \RuntimeException("Invalid snapshot file: {$snapshotPath}");
+        }
+
+        if (!in_array($snapshot['version'], ['1.0'], true)) {
+            throw new \RuntimeException(
+                "Unsupported snapshot version '{$snapshot['version']}'. " .
+                "Re-run 'snapshot' to create a fresh one."
+            );
+        }
+
+        return $snapshot;
+    }
+
+    /**
+     * Build a flat override index: package-relative path → {package, vendor_rel}.
+     * All Hyvä packages follow the Magento theme directory structure, so the mapping
+     * is always a direct 1:1 path. No prefix stripping or module-name prepending needed.
+     */
+    public static function buildOverrideIndex(array $packages): array
+    {
+        $index = [];
+
+        // Files at the root that are never theme-overrideable
+        $skipRootFiles = ['composer.json', 'composer.lock', 'registration.php', 'theme.xml', 'LICENSE', 'LICENSE.md', 'README.md'];
+
+        foreach ($packages as $pkgName => $pkg) {
+            foreach (array_keys($pkg['files']) as $vendorRel) {
+                // Skip dotfiles and root-level non-theme files
+                if (str_starts_with($vendorRel, '.')) {
+                    continue;
+                }
+
+                if (in_array($vendorRel, $skipRootFiles, true)) {
+                    continue;
+                }
+
+                // Skip files that are purely backend (etc/, Plugin/, Model/, etc.)
+                // but allow anything under a Magento_*, Hyva_*, or web/ directory
+                if (
+                    !str_contains($vendorRel, '/') ||  // root-level files already skipped above
+                    preg_match('/^(?:Magento_|Hyva_|web\/|media\/|templates\/|layout\/)/', $vendorRel)
+                ) {
+                    $index[$vendorRel] = [
+                        'package'    => $pkgName,
+                        'vendor_rel' => $vendorRel,
+                    ];
+                }
+            }
+        }
+
+        return $index;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ChangeDetector
+// ─────────────────────────────────────────────────────────────────────────────
+
+class ChangeDetector
+{
+    public function diff(array $oldSnapshot, array $newSnapshot): array
+    {
+        $result      = [];
+        $oldPackages = $oldSnapshot['packages'] ?? [];
+        $newPackages = $newSnapshot['packages'] ?? [];
+
+        foreach ($newPackages as $pkgName => $newPkg) {
+            $oldPkg = $oldPackages[$pkgName] ?? null;
+
+            if ($oldPkg === null) {
+                foreach ($newPkg['files'] as $relPath => $fileEntry) {
+                    $result[$pkgName][$relPath] = $this->makeEntry('added', null, $fileEntry, 'unknown', $newPkg['version']);
+                }
+            } else {
+                $diff = $this->diffPackage($oldPkg, $newPkg);
+                if (!empty($diff)) {
+                    $result[$pkgName] = $diff;
+                }
+            }
+        }
+
+        foreach ($oldPackages as $pkgName => $oldPkg) {
+            if (!isset($newPackages[$pkgName])) {
+                foreach ($oldPkg['files'] as $relPath => $fileEntry) {
+                    $result[$pkgName][$relPath] = $this->makeEntry('deleted', $fileEntry, null, $oldPkg['version'], 'removed');
+                }
+            }
+        }
+
+        return $result;
+    }
+
+    private function diffPackage(array $oldPkg, array $newPkg): array
+    {
+        $result   = [];
+        $oldFiles = $oldPkg['files'] ?? [];
+        $newFiles = $newPkg['files'] ?? [];
+
+        foreach ($newFiles as $relPath => $newEntry) {
+            if (!isset($oldFiles[$relPath])) {
+                $result[$relPath] = $this->makeEntry('added', null, $newEntry, $oldPkg['version'], $newPkg['version']);
+            }
+        }
+
+        foreach ($oldFiles as $relPath => $oldEntry) {
+            if (!isset($newFiles[$relPath])) {
+                $result[$relPath] = $this->makeEntry('deleted', $oldEntry, null, $oldPkg['version'], $newPkg['version']);
+            }
+        }
+
+        foreach ($newFiles as $relPath => $newEntry) {
+            if (!isset($oldFiles[$relPath])) {
+                continue;
+            }
+            $oldEntry = $oldFiles[$relPath];
+            if ($oldEntry['hash'] !== $newEntry['hash']) {
+                $entry                       = $this->makeEntry('modified', $oldEntry, $newEntry, $oldPkg['version'], $newPkg['version']);
+                $entry['comment_only_changed'] = ($oldEntry['content_hash'] === $newEntry['content_hash']);
+                $result[$relPath]            = $entry;
+            }
+        }
+
+        return $result;
+    }
+
+    private function makeEntry(
+        string $changeType,
+        ?array $oldEntry,
+        ?array $newEntry,
+        string $versionBefore,
+        string $versionAfter
+    ): array {
+        $ref = $newEntry ?? $oldEntry ?? [];
+
+        return [
+            'change_type'           => $changeType,
+            'category'              => $ref['category'] ?? 'other',
+            'has_alpine_before'     => $oldEntry['has_alpine'] ?? false,
+            'has_alpine_after'      => $newEntry['has_alpine'] ?? false,
+            'stores_defined_before' => $oldEntry['stores_defined'] ?? [],
+            'stores_defined_after'  => $newEntry['stores_defined'] ?? [],
+            'stores_used_before'    => $oldEntry['stores_used'] ?? [],
+            'stores_used_after'     => $newEntry['stores_used'] ?? [],
+            'comment_only_changed'  => false,
+            'size_before'           => $oldEntry['size'] ?? 0,
+            'size_after'            => $newEntry['size'] ?? 0,
+            'version_before'        => $versionBefore,
+            'version_after'         => $versionAfter,
+        ];
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RiskClassifier
+// ─────────────────────────────────────────────────────────────────────────────
+
+class RiskClassifier
+{
+    public function classify(array $fileChange, string $relPath): string
+    {
+        $changeType      = $fileChange['change_type'];
+        $category        = $fileChange['category'];
+        $hasAlpineBefore = $fileChange['has_alpine_before'];
+        $hasAlpineAfter  = $fileChange['has_alpine_after'];
+        $commentOnly     = $fileChange['comment_only_changed'] ?? false;
+        $isCriticalPath  = $this->isCriticalPath($relPath);
+
+        if ($category === 'css') {
+            return 'low';
+        }
+
+        if ($changeType === 'modified' && $commentOnly) {
+            return 'low';
+        }
+
+        if ($changeType === 'deleted') {
+            if ($hasAlpineBefore) {
+                return $isCriticalPath ? 'critical' : 'high';
+            }
+            return 'medium';
+        }
+
+        if ($isCriticalPath && ($hasAlpineBefore || $hasAlpineAfter)) {
+            return 'critical';
+        }
+
+        if ($hasAlpineBefore || $hasAlpineAfter) {
+            return 'high';
+        }
+
+        if (in_array($category, ['template', 'layout', 'js', 'php', 'xml'], true)) {
+            return 'medium';
+        }
+
+        return 'low';
+    }
+
+    public function isCriticalPath(string $relPath): bool
+    {
+        return (bool) preg_match('/(?:^|\/)(?:checkout|payment|cart)(?:\/|$|_)/i', $relPath);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OverrideMapper
+// ─────────────────────────────────────────────────────────────────────────────
+
+class OverrideMapper
+{
+    public function __construct(
+        private readonly string $themeDir,
+        private readonly string $excludeVendor = 'Magento'
+    ) {}
+
+    public function discoverThemes(): array
+    {
+        $themes = [];
+
+        if (!is_dir($this->themeDir)) {
+            return $themes;
+        }
+
+        foreach (glob($this->themeDir . '/*', GLOB_ONLYDIR) ?: [] as $vendorPath) {
+            $vendorName = basename($vendorPath);
+            if ($vendorName === $this->excludeVendor) {
+                continue;
+            }
+
+            foreach (glob($vendorPath . '/*', GLOB_ONLYDIR) ?: [] as $themePath) {
+                $themes[] = [
+                    'vendor'    => $vendorName,
+                    'theme'     => basename($themePath),
+                    'base_path' => $themePath,
+                ];
+            }
+        }
+
+        return $themes;
+    }
+
+    public function mapOverrides(
+        array $themes,
+        array $overrideIndex,
+        array $classifiedChanges
+    ): array {
+        $results = [];
+
+        foreach ($themes as $theme) {
+            $basePath = $theme['base_path'];
+
+            if (!is_dir($basePath)) {
+                continue;
+            }
+
+            $iterator = new \RecursiveIteratorIterator(
+                new \RecursiveDirectoryIterator($basePath, \RecursiveDirectoryIterator::SKIP_DOTS)
+            );
+
+            foreach ($iterator as $file) {
+                if (!$file->isFile()) {
+                    continue;
+                }
+
+                $absPath  = $file->getRealPath();
+                $relPath  = ltrim(str_replace($basePath, '', $absPath), '/\\');
+
+                $indexEntry = $overrideIndex[$relPath] ?? null;
+                if ($indexEntry === null) {
+                    continue; // Not a Hyvä file — skip
+                }
+
+                $pkg       = $indexEntry['package'];
+                $vendorRel = $indexEntry['vendor_rel'];
+                $change    = $classifiedChanges[$pkg][$vendorRel] ?? null;
+
+                $upstreamChange = $change ? $change['change_type'] : 'unchanged';
+                $risk           = $change ? ($change['risk'] ?? 'low') : 'low';
+                $impact         = $this->classifyImpact($risk, $upstreamChange);
+
+                $results[] = [
+                    'theme'           => $theme['vendor'] . '/' . $theme['theme'],
+                    'override_file'   => 'app/design/frontend/' . $theme['vendor'] . '/' . $theme['theme'] . '/' . $relPath,
+                    'upstream_pkg'    => $pkg,
+                    'upstream_file'   => $vendorRel,
+                    'upstream_change' => $upstreamChange,
+                    'risk'            => $risk,
+                    'impact'          => $impact,
+                ];
+            }
+        }
+
+        return $results;
+    }
+
+    public function classifyImpact(string $risk, string $changeType): string
+    {
+        if ($changeType === 'unchanged') {
+            return 'safe';
+        }
+
+        if ($changeType === 'added') {
+            return 'new upstream file';
+        }
+
+        return match ($risk) {
+            'critical'      => 'critical mismatch',
+            'high'          => 'likely broken',
+            'medium', 'low' => 'partially outdated',
+            default         => 'safe',
+        };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CrossModuleAnalyzer
+// ─────────────────────────────────────────────────────────────────────────────
+
+class CrossModuleAnalyzer
+{
+    public function analyze(array $packages, array $classifiedChanges): array
+    {
+        $storeChanges = $this->buildStoreChangeMap($classifiedChanges);
+        return $this->findCrossModuleRisks($storeChanges, $packages);
+    }
+
+    private function buildStoreChangeMap(array $classifiedChanges): array
+    {
+        $storeChanges = [];
+
+        foreach ($classifiedChanges as $pkg => $pkgChanges) {
+            foreach ($pkgChanges as $relPath => $change) {
+                $risk = $change['risk'] ?? 'low';
+                if (!in_array($risk, ['high', 'critical'], true)) {
+                    continue;
+                }
+
+                $before = $change['stores_defined_before'] ?? [];
+                $after  = $change['stores_defined_after'] ?? [];
+                $added  = array_diff($after, $before);
+                $removed = array_diff($before, $after);
+                $kept   = array_intersect($before, $after);
+
+                foreach (array_merge($added, $removed, $kept) as $storeName) {
+                    $storeChanges[$storeName][] = [
+                        'package' => $pkg,
+                        'file'    => $relPath,
+                        'risk'    => $risk,
+                        'status'  => in_array($storeName, $added, true)
+                            ? 'added'
+                            : (in_array($storeName, $removed, true) ? 'removed' : 'modified'),
+                    ];
+                }
+            }
+        }
+
+        return $storeChanges;
+    }
+
+    private function findCrossModuleRisks(array $storeChanges, array $packages): array
+    {
+        $risks = [];
+        $seen  = [];
+
+        foreach ($storeChanges as $storeName => $changedIn) {
+            foreach ($packages as $pkgName => $pkg) {
+                foreach ($pkg['files'] as $relPath => $fileEntry) {
+                    if (!in_array($storeName, $fileEntry['stores_used'] ?? [], true)) {
+                        continue;
+                    }
+
+                    foreach ($changedIn as $changeInfo) {
+                        if ($changeInfo['package'] === $pkgName) {
+                            continue; // Same package — not cross-module
+                        }
+
+                        $key = $storeName . '|' . $changeInfo['package'] . '|' . $pkgName . '|' . $relPath;
+                        if (isset($seen[$key])) {
+                            continue;
+                        }
+                        $seen[$key] = true;
+
+                        $risks[] = [
+                            'store'            => $storeName,
+                            'store_status'     => $changeInfo['status'],
+                            'changed_in_pkg'   => $changeInfo['package'],
+                            'changed_in_file'  => $changeInfo['file'],
+                            'change_risk'      => $changeInfo['risk'],
+                            'affected_pkg'     => $pkgName,
+                            'affected_file'    => $relPath,
+                        ];
+                    }
+                }
+            }
+        }
+
+        return $risks;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ReportGenerator
+// ─────────────────────────────────────────────────────────────────────────────
+
+class ReportGenerator
+{
+    public function generate(array $data): string
+    {
+        $sections = [
+            $this->renderHeader($data),
+            $this->renderExecutiveSummary($data),
+            $this->renderPackageVersions($data),
+            $this->renderChangeList($data),
+            $this->renderOverrideImpactMap($data),
+            $this->renderCriticalIssues($data),
+            $this->renderReviewRecommended($data),
+            $this->renderSafeToIgnore($data),
+            $this->renderCrossModuleRisks($data),
+        ];
+
+        return implode("\n\n", array_filter($sections)) . "\n";
+    }
+
+    private function renderHeader(array $data): string
+    {
+        return "# Hyvä Upgrade Impact Analysis\n\n" .
+            "> Generated: {$data['generated_at']}\n" .
+            "> Snapshot created: {$data['snapshot_created']}\n";
+    }
+
+    private function renderExecutiveSummary(array $data): string
+    {
+        $changes   = $data['changes'];
+        $overrides = $data['overrides'];
+
+        $pkgChanged = count($changes);
+        $pkgTotal   = count($data['new_packages']);
+
+        $riskCounts   = ['critical' => 0, 'high' => 0, 'medium' => 0, 'low' => 0];
+        $changeCounts = ['added' => 0, 'modified' => 0, 'deleted' => 0];
+
+        foreach ($changes as $pkgChanges) {
+            foreach ($pkgChanges as $change) {
+                $r = $change['risk'] ?? 'low';
+                $riskCounts[$r] = ($riskCounts[$r] ?? 0) + 1;
+                $changeCounts[$change['change_type']] = ($changeCounts[$change['change_type']] ?? 0) + 1;
+            }
+        }
+
+        $totalFiles = array_sum($changeCounts);
+
+        $impactCounts = [];
+        foreach ($overrides as $o) {
+            $impactCounts[$o['impact']] = ($impactCounts[$o['impact']] ?? 0) + 1;
+        }
+
+        $lines = [
+            "## 1. Executive Summary",
+            "",
+            "| Metric | Count |",
+            "|--------|-------|",
+            "| Hyvä packages changed | {$pkgChanged} of {$pkgTotal} |",
+            "| Files changed | {$totalFiles} ({$changeCounts['added']} added, {$changeCounts['modified']} modified, {$changeCounts['deleted']} deleted) |",
+            "| Critical risk | **{$riskCounts['critical']}** |",
+            "| High risk | {$riskCounts['high']} |",
+            "| Medium risk | {$riskCounts['medium']} |",
+            "| Low risk | {$riskCounts['low']} |",
+            "| Theme overrides total | " . count($overrides) . " |",
+            "| Critical mismatch | **" . ($impactCounts['critical mismatch'] ?? 0) . "** |",
+            "| Likely broken | " . ($impactCounts['likely broken'] ?? 0) . " |",
+            "| Partially outdated | " . ($impactCounts['partially outdated'] ?? 0) . " |",
+            "| Safe | " . ($impactCounts['safe'] ?? 0) . " |",
+            "",
+        ];
+
+        if ($riskCounts['critical'] > 0 || $riskCounts['high'] > 0) {
+            $lines[] = "> **Action required**: Review all CRITICAL and HIGH risk items before deploying.";
+        } else {
+            $lines[] = "> No critical issues found. Review medium-risk items as needed.";
+        }
+
+        return implode("\n", $lines);
+    }
+
+    private function renderPackageVersions(array $data): string
+    {
+        $lines = ["## 2. Package Version Changes", ""];
+
+        $allPkgs    = array_unique(array_merge(array_keys($data['old_packages']), array_keys($data['new_packages'])));
+        $headers    = ['Package', 'Type', 'Before', 'After', '+Added', '~Modified', '-Deleted'];
+        $rows       = [];
+
+        foreach ($allPkgs as $pkg) {
+            $oldVer = $data['old_packages'][$pkg]['version'] ?? '—';
+            $newVer = $data['new_packages'][$pkg]['version'] ?? '—';
+            $type   = $data['new_packages'][$pkg]['type'] ?? $data['old_packages'][$pkg]['type'] ?? 'unknown';
+
+            $added = $modified = $deleted = 0;
+            foreach ($data['changes'][$pkg] ?? [] as $c) {
+                match ($c['change_type']) {
+                    'added'    => $added++,
+                    'modified' => $modified++,
+                    'deleted'  => $deleted++,
+                    default    => null,
+                };
+            }
+
+            $rows[] = [$pkg, $type, $oldVer, $newVer, (string) $added, (string) $modified, (string) $deleted];
+        }
+
+        $lines[] = empty($rows) ? '_No packages found._' : $this->renderTable($headers, $rows);
+        return implode("\n", $lines);
+    }
+
+    private function renderChangeList(array $data): string
+    {
+        $lines = ["## 3. Consolidated Change List", ""];
+
+        $allChanges = [];
+        foreach ($data['changes'] as $pkgName => $pkgChanges) {
+            $shortPkg = basename($pkgName);
+            foreach ($pkgChanges as $relPath => $change) {
+                $allChanges[] = [
+                    'pkg'    => $shortPkg,
+                    'path'   => $relPath,
+                    'type'   => $change['change_type'],
+                    'cat'    => $change['category'],
+                    'risk'   => $change['risk'] ?? 'low',
+                    'impact' => $this->findOverrideImpact($relPath, $pkgName, $data['overrides']),
+                ];
+            }
+        }
+
+        if (empty($allChanges)) {
+            $lines[] = '_No changes detected._';
+            return implode("\n", $lines);
+        }
+
+        usort($allChanges, fn($a, $b) => $this->riskOrder($b['risk']) <=> $this->riskOrder($a['risk']));
+
+        $headers = ['Module', 'File', 'Change', 'Category', 'Risk', 'Override Impact'];
+        $rows    = [];
+        foreach ($allChanges as $c) {
+            $rows[] = [$c['pkg'], $this->truncate($c['path'], 60), $c['type'], $c['cat'], $c['risk'], $c['impact']];
+        }
+
+        $lines[] = $this->renderTable($headers, $rows);
+        return implode("\n", $lines);
+    }
+
+    private function findOverrideImpact(string $relPath, string $pkgName, array $overrides): string
+    {
+        foreach ($overrides as $o) {
+            if ($o['upstream_file'] === $relPath && $o['upstream_pkg'] === $pkgName) {
+                return $o['impact'];
+            }
+        }
+        return '—';
+    }
+
+    private function renderOverrideImpactMap(array $data): string
+    {
+        $lines     = ["## 4. Override Impact Map", ""];
+        $overrides = $data['overrides'];
+
+        if (empty($overrides)) {
+            $lines[] = '_No custom theme overrides found in app/design/frontend/._';
+            return implode("\n", $lines);
+        }
+
+        usort($overrides, fn($a, $b) => $this->impactOrder($b['impact']) <=> $this->impactOrder($a['impact']));
+
+        $headers = ['Override File', 'Upstream Package', 'Upstream File', 'Change', 'Impact'];
+        $rows    = [];
+        foreach ($overrides as $o) {
+            $rows[] = [
+                $this->truncate($o['override_file'], 55),
+                basename($o['upstream_pkg']),
+                $this->truncate($o['upstream_file'], 50),
+                $o['upstream_change'],
+                $o['impact'],
+            ];
+        }
+
+        $lines[] = $this->renderTable($headers, $rows);
+        return implode("\n", $lines);
+    }
+
+    private function renderCriticalIssues(array $data): string
+    {
+        $items = [];
+
+        foreach ($data['changes'] as $pkgName => $pkgChanges) {
+            foreach ($pkgChanges as $relPath => $change) {
+                $risk = $change['risk'] ?? 'low';
+                if (!in_array($risk, ['critical', 'high'], true)) {
+                    continue;
+                }
+
+                $override = null;
+                foreach ($data['overrides'] as $o) {
+                    if ($o['upstream_file'] === $relPath && $o['upstream_pkg'] === $pkgName) {
+                        $override = $o;
+                        break;
+                    }
+                }
+
+                $items[] = compact('risk', 'pkgName', 'relPath', 'change', 'override');
+            }
+        }
+
+        if (empty($items)) {
+            return '';
+        }
+
+        usort($items, fn($a, $b) => $this->riskOrder($b['risk']) <=> $this->riskOrder($a['risk']));
+
+        $lines = ["## 5. Critical Issues (Must Fix)", ""];
+
+        foreach ($items as $item) {
+            $risk   = strtoupper($item['risk']);
+            $change = $item['change'];
+            $lines[] = "### {$risk}: `{$item['relPath']}` in `{$item['pkgName']}`";
+            $lines[] = "";
+            $lines[] = "- **Change**: {$change['change_type']} ({$change['version_before']} → {$change['version_after']})";
+
+            if ($change['has_alpine_before'] && $change['has_alpine_after']) {
+                $lines[] = "- **Alpine.js**: patterns present in both versions — reactive behavior may have changed";
+            } elseif ($change['has_alpine_after']) {
+                $lines[] = "- **Alpine.js**: patterns added in new version";
+            } elseif ($change['has_alpine_before']) {
+                $lines[] = "- **Alpine.js**: patterns removed in new version";
+            }
+
+            $allStores = array_values(array_unique(array_merge(
+                $change['stores_defined_before'],
+                $change['stores_defined_after']
+            )));
+            if (!empty($allStores)) {
+                $lines[] = "- **Alpine stores**: `" . implode('`, `', $allStores) . "`";
+            }
+
+            if ($item['override']) {
+                $lines[] = "- **Your override**: `{$item['override']['override_file']}`";
+                $lines[] = "- **Impact**: {$item['override']['impact']}";
+                $lines[] = "- **Action**: Diff your override against the new upstream file and merge changes.";
+            } else {
+                $lines[] = "- **No direct override** — this change may still affect behavior inherited by your theme.";
+                $lines[] = "- **Action**: Review whether your theme is impacted by this upstream change.";
+            }
+
+            $lines[] = "";
+        }
+
+        return implode("\n", $lines);
+    }
+
+    private function renderReviewRecommended(array $data): string
+    {
+        $items = [];
+
+        foreach ($data['changes'] as $pkgName => $pkgChanges) {
+            foreach ($pkgChanges as $relPath => $change) {
+                if (($change['risk'] ?? '') !== 'medium') {
+                    continue;
+                }
+                $override = null;
+                foreach ($data['overrides'] as $o) {
+                    if ($o['upstream_file'] === $relPath && $o['upstream_pkg'] === $pkgName) {
+                        $override = $o;
+                        break;
+                    }
+                }
+                $items[] = compact('pkgName', 'relPath', 'change', 'override');
+            }
+        }
+
+        if (empty($items)) {
+            return '';
+        }
+
+        $lines = ["## 6. Review Recommended (Medium Risk)", ""];
+        foreach ($items as $item) {
+            $shortPkg = basename($item['pkgName']);
+            $line     = "- `{$shortPkg}`: `{$item['relPath']}` — {$item['change']['change_type']}";
+            if ($item['override']) {
+                $line .= " → override: **{$item['override']['impact']}**";
+            }
+            $lines[] = $line;
+        }
+
+        return implode("\n", $lines);
+    }
+
+    private function renderSafeToIgnore(array $data): string
+    {
+        $count = 0;
+        foreach ($data['changes'] as $pkgChanges) {
+            foreach ($pkgChanges as $change) {
+                if (($change['risk'] ?? '') === 'low') {
+                    $count++;
+                }
+            }
+        }
+
+        if ($count === 0) {
+            return '';
+        }
+
+        return "## 7. Safe to Ignore (Low Risk)\n\n" .
+            "{$count} low-risk change(s) detected (CSS/LESS, comment-only, or non-frontend files). No action required.";
+    }
+
+    private function renderCrossModuleRisks(array $data): string
+    {
+        $risks = $data['cross_risks'];
+
+        if (empty($risks)) {
+            return "## 8. Cross-Module Interaction Risks\n\nNo cross-module Alpine store interaction risks detected.";
+        }
+
+        $lines = [
+            "## 8. Cross-Module Interaction Risks",
+            "",
+            "> The following Alpine store changes in one package are consumed by other packages. Review for compatibility.",
+            "",
+        ];
+
+        $headers = ['Store', 'Status', 'Changed In Pkg', 'Changed In File', 'Affected Pkg', 'Affected File'];
+        $rows    = [];
+        foreach ($risks as $r) {
+            $rows[] = [
+                $r['store'],
+                $r['store_status'],
+                basename($r['changed_in_pkg']),
+                $this->truncate($r['changed_in_file'], 40),
+                basename($r['affected_pkg']),
+                $this->truncate($r['affected_file'], 40),
+            ];
+        }
+
+        $lines[] = $this->renderTable($headers, $rows);
+        $lines[] = "";
+        $lines[] = "> **Note**: Dynamic store names computed at runtime cannot be detected statically. Manual review is always recommended for Alpine store interfaces.";
+
+        return implode("\n", $lines);
+    }
+
+    private function renderTable(array $headers, array $rows): string
+    {
+        if (empty($rows)) {
+            return '_No data._';
+        }
+
+        $widths = array_map('strlen', $headers);
+
+        foreach ($rows as $row) {
+            foreach ($row as $i => $cell) {
+                $widths[$i] = max($widths[$i] ?? 0, strlen((string) ($cell ?? '')));
+            }
+        }
+
+        $pad = static fn(string $s, int $w): string => str_pad($s, $w);
+
+        $header = '| ' . implode(' | ', array_map($pad, $headers, $widths)) . ' |';
+        $sep    = '| ' . implode(' | ', array_map(static fn(int $w) => str_repeat('-', $w), $widths)) . ' |';
+
+        $rowLines = [];
+        $colCount = count($headers);
+        foreach ($rows as $row) {
+            $cells = [];
+            for ($i = 0; $i < $colCount; $i++) {
+                $cells[] = $pad((string) ($row[$i] ?? ''), $widths[$i]);
+            }
+            $rowLines[] = '| ' . implode(' | ', $cells) . ' |';
+        }
+
+        return implode("\n", [$header, $sep, ...$rowLines]);
+    }
+
+    private function riskOrder(string $risk): int
+    {
+        return match ($risk) {
+            'critical' => 4,
+            'high'     => 3,
+            'medium'   => 2,
+            'low'      => 1,
+            default    => 0,
+        };
+    }
+
+    private function impactOrder(string $impact): int
+    {
+        return match ($impact) {
+            'critical mismatch'  => 4,
+            'likely broken'      => 3,
+            'partially outdated' => 2,
+            'new upstream file'  => 1,
+            'safe'               => 0,
+            default              => 0,
+        };
+    }
+
+    private function truncate(string $path, int $max): string
+    {
+        if (strlen($path) <= $max) {
+            return $path;
+        }
+        $half = (int) (($max - 3) / 2);
+        return substr($path, 0, $half) . '...' . substr($path, -($max - $half - 3));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bootstrap
+// ─────────────────────────────────────────────────────────────────────────────
+
+if (PHP_SAPI !== 'cli') {
+    echo "This script must be run from the command line.\n";
+    exit(1);
+}
+
+if (PHP_VERSION_ID < 80100) {
+    fwrite(STDERR, "PHP 8.1 or higher is required (found " . PHP_VERSION . ").\n");
+    exit(1);
+}
+
+try {
+    (new CliApplication(dirname(__DIR__)))->run($argv);
+} catch (\RuntimeException $e) {
+    fwrite(STDERR, "Error: " . $e->getMessage() . "\n");
+    exit(1);
+} catch (\Throwable $e) {
+    fwrite(STDERR, "Unexpected error: " . $e->getMessage() . "\n");
+    fwrite(STDERR, $e->getTraceAsString() . "\n");
+    exit(1);
+}

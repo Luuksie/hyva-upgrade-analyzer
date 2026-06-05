@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+
+## Description: Analyze Hyvä upgrade impact — compare current vendor against snapshot and report override risks
+## Usage: hyva:check [--snapshot=.hyva-snapshot.json] [--output=hyva-upgrade-report.md]
+## Example: ddev hyva:check
+## Example: ddev hyva:check --output=my-report.md
+
+php "${DDEV_APPROOT}/bin/hyva-upgrade-analyzer" analyze "$@"
