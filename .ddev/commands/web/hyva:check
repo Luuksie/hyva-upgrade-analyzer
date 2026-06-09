@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 
 ## Description: Analyze Hyvä upgrade impact — compare current vendor against snapshot and report override risks
-## Usage: hyva:check [--snapshot=.hyva-snapshot.json] [--output=hyva-upgrade-report.md]
+## Usage: hyva:check [--snapshot=.hyva-snapshot.json] [--output=hyva-upgrade-report.md] [--theme-dir=app/design/frontend/Vendor/theme] [--html] [--md]
 ## Example: ddev hyva:check
-## Example: ddev hyva:check --output=my-report.md
+## Example: ddev hyva:check --theme-dir=app/design/frontend/Autosleutel/default
+## Example: ddev hyva:check --theme-dir=app/design/frontend/Autosleutel/default --output=report.html
+## Example: ddev hyva:check --theme-dir=app/design/frontend/Autosleutel/default --html
 
 php "${DDEV_APPROOT}/bin/hyva-upgrade-analyzer" analyze "$@"

@@ -144,17 +144,26 @@ class CliApplication
         }
 
         $this->stderr("Mapping theme overrides...");
-        $overrideMapper = new OverrideMapper($themeDir, $excludeVendor);
+        $overrideMapper = new OverrideMapper($themeDir, $excludeVendor, $vendorDir);
         $themes         = $overrideMapper->discoverThemes();
+
+        if (empty($themes)) {
+            $this->stderr("  No themes found in {$themeDir}.");
+        } else {
+            foreach ($themes as $t) {
+                $this->stderr("  Found theme: {$t['vendor']}/{$t['theme']} at {$t['base_path']}");
+            }
+        }
+
         $overrides      = $overrideMapper->mapOverrides($themes, $newSnapshot['override_index'], $classifiedChanges);
+        $this->stderr("  " . count($overrides) . " override file(s) matched against Hyvä packages.");
 
         $this->stderr("Analyzing cross-module interactions...");
         $crossAnalyzer = new CrossModuleAnalyzer();
         $crossRisks    = $crossAnalyzer->analyze($newSnapshot['packages'], $classifiedChanges);
 
         $this->stderr("Generating report...");
-        $generator = new ReportGenerator();
-        $report    = $generator->generate([
+        $reportData = [
             'old_packages'     => $oldSnapshot['packages'] ?? [],
             'new_packages'     => $newSnapshot['packages'],
             'changes'          => $classifiedChanges,
@@ -162,10 +171,30 @@ class CliApplication
             'cross_risks'      => $crossRisks,
             'generated_at'     => date('c'),
             'snapshot_created' => $oldSnapshot['created_at'] ?? 'unknown',
-        ]);
+        ];
+
+        $isHtml    = strtolower(pathinfo($outputPath, PATHINFO_EXTENSION)) === 'html';
+        $generator = $isHtml ? new HtmlReportGenerator() : new ReportGenerator();
+        $report    = $generator->generate($reportData);
 
         file_put_contents($outputPath, $report);
         $this->stderr("Report written to {$outputPath}");
+
+        // --html flag: also write an HTML version alongside the primary output
+        if (isset($opts['html']) && !$isHtml) {
+            $htmlPath  = preg_replace('/\.[^.]+$/', '', $outputPath) . '.html';
+            $htmlReport = (new HtmlReportGenerator())->generate($reportData);
+            file_put_contents($htmlPath, $htmlReport);
+            $this->stderr("HTML report written to {$htmlPath}");
+        }
+
+        // --md flag: also write a markdown version alongside an HTML primary output
+        if (isset($opts['md']) && $isHtml) {
+            $mdPath  = preg_replace('/\.[^.]+$/', '', $outputPath) . '.md';
+            $mdReport = (new ReportGenerator())->generate($reportData);
+            file_put_contents($mdPath, $mdReport);
+            $this->stderr("Markdown report written to {$mdPath}");
+        }
 
         // Exit 1 if any critical issues found
         foreach ($classifiedChanges as $pkgChanges) {
@@ -513,6 +542,12 @@ class SnapshotManager
                     continue;
                 }
 
+                // Skip markdown and module.xml — not theme-overrideable content
+                $basename = basename($vendorRel);
+                if (str_ends_with($basename, '.md') || $basename === 'module.xml') {
+                    continue;
+                }
+
                 // Skip files that are purely backend (etc/, Plugin/, Model/, etc.)
                 // but allow anything under a Magento_*, Hyva_*, or web/ directory
                 if (
@@ -688,7 +723,8 @@ class OverrideMapper
 {
     public function __construct(
         private readonly string $themeDir,
-        private readonly string $excludeVendor = 'Magento'
+        private readonly string $excludeVendor = 'Magento',
+        private readonly string $vendorDir = ''
     ) {}
 
     public function discoverThemes(): array
@@ -699,7 +735,22 @@ class OverrideMapper
             return $themes;
         }
 
-        foreach (glob($this->themeDir . '/*', GLOB_ONLYDIR) ?: [] as $vendorPath) {
+        $dir     = rtrim($this->themeDir, '/\\');
+        $subdirs = glob($dir . '/*', GLOB_ONLYDIR) ?: [];
+
+        // If immediate subdirs look like Magento module areas (contain _), this path IS a theme,
+        // not a parent directory. Return it directly instead of walking vendor/theme structure.
+        $hasModuleDirs = !empty(array_filter($subdirs, fn($d) => str_contains(basename($d), '_')));
+
+        if ($hasModuleDirs) {
+            return [[
+                'vendor'    => basename(dirname($dir)),
+                'theme'     => basename($dir),
+                'base_path' => $dir,
+            ]];
+        }
+
+        foreach ($subdirs as $vendorPath) {
             $vendorName = basename($vendorPath);
             if ($vendorName === $this->excludeVendor) {
                 continue;
@@ -756,14 +807,20 @@ class OverrideMapper
                 $risk           = $change ? ($change['risk'] ?? 'low') : 'low';
                 $impact         = $this->classifyImpact($risk, $upstreamChange);
 
+                $absUpstream = $this->vendorDir
+                    ? $this->vendorDir . '/' . $pkg . '/' . $vendorRel
+                    : null;
+
                 $results[] = [
-                    'theme'           => $theme['vendor'] . '/' . $theme['theme'],
-                    'override_file'   => 'app/design/frontend/' . $theme['vendor'] . '/' . $theme['theme'] . '/' . $relPath,
-                    'upstream_pkg'    => $pkg,
-                    'upstream_file'   => $vendorRel,
-                    'upstream_change' => $upstreamChange,
-                    'risk'            => $risk,
-                    'impact'          => $impact,
+                    'theme'               => $theme['vendor'] . '/' . $theme['theme'],
+                    'override_file'       => 'app/design/frontend/' . $theme['vendor'] . '/' . $theme['theme'] . '/' . $relPath,
+                    'upstream_pkg'        => $pkg,
+                    'upstream_file'       => $vendorRel,
+                    'upstream_change'     => $upstreamChange,
+                    'risk'                => $risk,
+                    'impact'              => $impact,
+                    'abs_override_path'   => $absPath,
+                    'abs_upstream_path'   => $absUpstream,
                 ];
             }
         }
@@ -877,6 +934,173 @@ class CrossModuleAnalyzer
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// DiffHelper
+// ─────────────────────────────────────────────────────────────────────────────
+
+class DiffHelper
+{
+    private const DIFF_IMPACTS = ['critical mismatch', 'likely broken'];
+
+    public static function shouldDiff(array $override): bool
+    {
+        return in_array($override['impact'], self::DIFF_IMPACTS, true)
+            && !empty($override['abs_override_path'])
+            && !empty($override['abs_upstream_path'])
+            && file_exists($override['abs_override_path'])
+            && file_exists($override['abs_upstream_path']);
+    }
+
+    public static function generate(array $override): ?string
+    {
+        if (!self::shouldDiff($override)) {
+            return null;
+        }
+
+        $upstreamLines = file($override['abs_upstream_path'], FILE_IGNORE_NEW_LINES);
+        $themeLines    = file($override['abs_override_path'], FILE_IGNORE_NEW_LINES);
+
+        if ($upstreamLines === false || $themeLines === false) {
+            return null;
+        }
+
+        if ($upstreamLines === $themeLines) {
+            return null;
+        }
+
+        $label1 = 'upstream/' . $override['upstream_file'];
+        $label2 = 'your-theme/' . $override['upstream_file'];
+
+        return self::unifiedDiff($upstreamLines, $themeLines, $label1, $label2);
+    }
+
+    private static function unifiedDiff(array $a, array $b, string $label1, string $label2, int $context = 3): string
+    {
+        $matrix = [];
+        $aLen   = count($a);
+        $bLen   = count($b);
+
+        // LCS via dynamic programming
+        $lcs = array_fill(0, $aLen + 1, array_fill(0, $bLen + 1, 0));
+        for ($i = $aLen - 1; $i >= 0; $i--) {
+            for ($j = $bLen - 1; $j >= 0; $j--) {
+                $lcs[$i][$j] = $a[$i] === $b[$j]
+                    ? $lcs[$i + 1][$j + 1] + 1
+                    : max($lcs[$i + 1][$j], $lcs[$i][$j + 1]);
+            }
+        }
+
+        // Build edit list: each entry is ['op' => ' '|'+'|'-', 'line' => string]
+        $edits = [];
+        $i = $j = 0;
+        while ($i < $aLen || $j < $bLen) {
+            if ($i < $aLen && $j < $bLen && $a[$i] === $b[$j]) {
+                $edits[] = [' ', $a[$i]];
+                $i++; $j++;
+            } elseif ($j < $bLen && ($i >= $aLen || ($lcs[$i][$j + 1] ?? 0) >= ($lcs[$i + 1][$j] ?? 0))) {
+                $edits[] = ['+', $b[$j]];
+                $j++;
+            } else {
+                $edits[] = ['-', $a[$i]];
+                $i++;
+            }
+        }
+
+        // Collect hunk ranges (changed lines ± context)
+        $changed = [];
+        foreach ($edits as $idx => $edit) {
+            if ($edit[0] !== ' ') {
+                for ($k = max(0, $idx - $context); $k <= min(count($edits) - 1, $idx + $context); $k++) {
+                    $changed[$k] = true;
+                }
+            }
+        }
+
+        if (empty($changed)) {
+            return '';
+        }
+
+        // Build unified diff output
+        $out   = "--- {$label1}\n+++ {$label2}\n";
+        $aLine = $bLine = 1;
+        $prev  = -2;
+        $hunk  = '';
+        $ha    = $hb = $haStart = $hbStart = 0;
+
+        foreach ($changed as $idx => $_) {
+            if ($idx > $prev + 1) {
+                if ($hunk !== '') {
+                    $out .= "@@ -{$haStart},{$ha} +{$hbStart},{$hb} @@\n" . $hunk;
+                }
+                $hunk    = '';
+                $ha      = $hb = 0;
+                $haStart = $aLine;
+                $hbStart = $bLine;
+                // rewind aLine/bLine to hunk start
+                $tmpA = $tmpB = 1;
+                for ($k = 0; $k < $idx; $k++) {
+                    if ($edits[$k][0] !== '+') $tmpA++;
+                    if ($edits[$k][0] !== '-') $tmpB++;
+                }
+                $haStart = $tmpA;
+                $hbStart = $tmpB;
+            }
+
+            [$op, $line] = $edits[$idx];
+            $hunk .= $op . $line . "\n";
+            if ($op !== '+') $ha++;
+            if ($op !== '-') $hb++;
+            if ($op !== '+') $aLine++;
+            if ($op !== '-') $bLine++;
+            $prev = $idx;
+        }
+
+        if ($hunk !== '') {
+            $out .= "@@ -{$haStart},{$ha} +{$hbStart},{$hb} @@\n" . $hunk;
+        }
+
+        return $out;
+    }
+
+    public static function classify(string $diff): string
+    {
+        $behavioral  = false;
+        $structural  = false;
+        $styling     = false;
+        $a11y        = false;
+
+        foreach (explode("\n", $diff) as $line) {
+            // Only look at added/removed lines, not context or headers
+            if (!preg_match('/^[+\-](?![+\-])/', $line)) {
+                continue;
+            }
+            $content = substr($line, 1);
+
+            if (preg_match('/\bx-[\w:]+|@[\w.]+\s*=|\bx-data\b|\bx-init\b/', $content)) {
+                $behavioral = true;
+            }
+            if (preg_match('/aria-[\w-]+|role=/', $content)) {
+                $a11y = true;
+            }
+            if (preg_match('/<\?(?:php|=)|\$[a-zA-Z_]/', $content)) {
+                $structural = true;
+            }
+            if (preg_match('/\bclass=/', $content)) {
+                $styling = true;
+            }
+        }
+
+        $types = array_filter([
+            $behavioral ? 'behavioral' : null,
+            $structural ? 'structural' : null,
+            $a11y       ? 'accessibility' : null,
+            $styling    ? 'styling'    : null,
+        ]);
+
+        return implode(', ', $types) ?: 'other';
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ReportGenerator
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -891,6 +1115,7 @@ class ReportGenerator
             $this->renderChangeList($data),
             $this->renderOverrideImpactMap($data),
             $this->renderCriticalIssues($data),
+            $this->renderOverrideDiffs($data),
             $this->renderReviewRecommended($data),
             $this->renderSafeToIgnore($data),
             $this->renderCrossModuleRisks($data),
@@ -1038,17 +1263,17 @@ class ReportGenerator
 
     private function renderOverrideImpactMap(array $data): string
     {
-        $lines     = ["## 4. Override Impact Map", ""];
-        $overrides = $data['overrides'];
+        $lines     = ["## 4. Theme Files to Update", ""];
+        $overrides = array_filter($data['overrides'], fn($o) => $o['impact'] !== 'safe');
 
         if (empty($overrides)) {
-            $lines[] = '_No custom theme overrides found in app/design/frontend/._';
+            $lines[] = '_All theme overrides are safe — no action required._';
             return implode("\n", $lines);
         }
 
         usort($overrides, fn($a, $b) => $this->impactOrder($b['impact']) <=> $this->impactOrder($a['impact']));
 
-        $headers = ['Override File', 'Upstream Package', 'Upstream File', 'Change', 'Impact'];
+        $headers = ['Your Theme File', 'Upstream Package', 'Upstream File', 'Change', 'Impact'];
         $rows    = [];
         foreach ($overrides as $o) {
             $rows[] = [
@@ -1170,6 +1395,36 @@ class ReportGenerator
         return implode("\n", $lines);
     }
 
+    private function renderOverrideDiffs(array $data): string
+    {
+        $lines = [];
+
+        foreach ($data['overrides'] as $o) {
+            $diff = DiffHelper::generate($o);
+            if ($diff === null) {
+                continue;
+            }
+
+            $classification = DiffHelper::classify($diff);
+            $impact         = strtoupper($o['impact']);
+            $lines[] = "### {$impact}: `{$o['override_file']}`";
+            $lines[] = "";
+            $lines[] = "> Changes detected: {$classification}";
+            $lines[] = "";
+            $lines[] = "```diff";
+            $lines[] = rtrim($diff);
+            $lines[] = "```";
+            $lines[] = "";
+        }
+
+        if (empty($lines)) {
+            return '';
+        }
+
+        array_unshift($lines, "## File Diffs — Action Required", "");
+        return implode("\n", $lines);
+    }
+
     private function renderSafeToIgnore(array $data): string
     {
         $count = 0;
@@ -1286,6 +1541,383 @@ class ReportGenerator
         }
         $half = (int) (($max - 3) / 2);
         return substr($path, 0, $half) . '...' . substr($path, -($max - $half - 3));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HtmlReportGenerator
+// ─────────────────────────────────────────────────────────────────────────────
+
+class HtmlReportGenerator
+{
+    private const RISK_COLORS = [
+        'critical'           => '#dc2626',
+        'high'               => '#ea580c',
+        'medium'             => '#d97706',
+        'low'                => '#16a34a',
+        'critical mismatch'  => '#dc2626',
+        'likely broken'      => '#ea580c',
+        'partially outdated' => '#d97706',
+        'new upstream file'  => '#2563eb',
+        'safe'               => '#16a34a',
+        'unchanged'          => '#6b7280',
+        'added'              => '#2563eb',
+        'modified'           => '#d97706',
+        'deleted'            => '#dc2626',
+    ];
+
+    public function generate(array $data): string
+    {
+        $riskCounts   = ['critical' => 0, 'high' => 0, 'medium' => 0, 'low' => 0];
+        $changeCounts = ['added' => 0, 'modified' => 0, 'deleted' => 0];
+        foreach ($data['changes'] as $pkgChanges) {
+            foreach ($pkgChanges as $change) {
+                $r = $change['risk'] ?? 'low';
+                $riskCounts[$r] = ($riskCounts[$r] ?? 0) + 1;
+                $changeCounts[$change['change_type']] = ($changeCounts[$change['change_type']] ?? 0) + 1;
+            }
+        }
+        $impactCounts = [];
+        foreach ($data['overrides'] as $o) {
+            $impactCounts[$o['impact']] = ($impactCounts[$o['impact']] ?? 0) + 1;
+        }
+        $pkgChanged = count($data['changes']);
+        $pkgTotal   = count($data['new_packages']);
+
+        $body = implode("\n", [
+            $this->renderSummaryCards($riskCounts, $impactCounts, $changeCounts, $pkgChanged, $pkgTotal),
+            $this->renderOverrideTable($data['overrides']),
+            $this->renderOverrideDiffs($data['overrides']),
+            $this->renderPackageTable($data),
+            $this->renderChangeTable($data),
+            $this->renderCriticalDetail($data),
+            $this->renderCrossModuleTable($data['cross_risks']),
+        ]);
+
+        return $this->wrap($body, $data['generated_at'], $data['snapshot_created']);
+    }
+
+    private function badge(string $label): string
+    {
+        $color = self::RISK_COLORS[strtolower($label)] ?? '#6b7280';
+        return "<span style=\"background:{$color};color:#fff;padding:2px 8px;border-radius:4px;font-size:0.8em;white-space:nowrap\">{$label}</span>";
+    }
+
+    private function h(string $s): string
+    {
+        return htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    }
+
+    private function renderSummaryCards(array $risk, array $impact, array $changes, int $pkgChanged, int $pkgTotal): string
+    {
+        $cards = [
+            ['Critical risk',       $risk['critical'],                        '#dc2626'],
+            ['High risk',           $risk['high'],                            '#ea580c'],
+            ['Medium risk',         $risk['medium'],                          '#d97706'],
+            ['Low risk',            $risk['low'],                             '#16a34a'],
+            ['Packages changed',    "{$pkgChanged}/{$pkgTotal}",              '#2563eb'],
+            ['Critical mismatch',   $impact['critical mismatch'] ?? 0,        '#dc2626'],
+            ['Likely broken',       $impact['likely broken'] ?? 0,            '#ea580c'],
+            ['Partially outdated',  $impact['partially outdated'] ?? 0,       '#d97706'],
+            ['Safe overrides',      $impact['safe'] ?? 0,                     '#16a34a'],
+        ];
+
+        $html = '<div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:32px">';
+        foreach ($cards as [$label, $count, $color]) {
+            $html .= "<div style=\"background:#fff;border:1px solid #e5e7eb;border-top:4px solid {$color};border-radius:6px;padding:16px 20px;min-width:140px\">
+                <div style=\"font-size:1.6em;font-weight:700;color:{$color}\">{$count}</div>
+                <div style=\"font-size:0.85em;color:#6b7280;margin-top:4px\">{$label}</div>
+            </div>";
+        }
+        $html .= '</div>';
+        return $html;
+    }
+
+    private function renderOverrideTable(array $overrides): string
+    {
+        $safeCount = count(array_filter($overrides, fn($o) => $o['impact'] === 'safe'));
+        $overrides = array_values(array_filter($overrides, fn($o) => $o['impact'] !== 'safe'));
+
+        if (empty($overrides)) {
+            return '<section><h2>Theme Files to Update</h2><p><em>All theme overrides are safe — no action required.</em></p></section>';
+        }
+
+        usort($overrides, function ($a, $b) {
+            $order = ['critical mismatch' => 4, 'likely broken' => 3, 'partially outdated' => 2, 'new upstream file' => 1, 'safe' => 0];
+            return ($order[$b['impact']] ?? 0) <=> ($order[$a['impact']] ?? 0);
+        });
+
+        $impacts   = array_values(array_unique(array_column($overrides, 'impact')));
+        $filterBtns = '<div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap">
+            <button onclick="filterOverrides(\'all\')" style="padding:4px 12px;border-radius:4px;border:1px solid #d1d5db;cursor:pointer;background:#f3f4f6">All</button>';
+        foreach ($impacts as $imp) {
+            $filterBtns .= '<button onclick="filterOverrides(\'' . $this->h($imp) . '\')" style="padding:4px 12px;border-radius:4px;border:1px solid #d1d5db;cursor:pointer;background:#f3f4f6">' . $this->h(ucfirst($imp)) . '</button>';
+        }
+        $filterBtns .= '</div>';
+
+        $rows = '';
+        foreach ($overrides as $o) {
+            $imp = $this->h($o['impact']);
+            $rows .= "<tr data-impact=\"{$imp}\">
+                <td style=\"font-family:monospace;font-size:0.8em\">{$this->h($o['override_file'])}</td>
+                <td style=\"font-family:monospace;font-size:0.8em\">{$this->h(basename($o['upstream_pkg']))}</td>
+                <td style=\"font-family:monospace;font-size:0.8em\">{$this->h($o['upstream_file'])}</td>
+                <td>{$this->badge($o['upstream_change'])}</td>
+                <td>{$this->badge($o['impact'])}</td>
+            </tr>\n";
+        }
+
+        $safeNote = $safeCount > 0 ? " <span style=\"font-size:0.75em;font-weight:400;color:#6b7280\">({$safeCount} safe overrides hidden)</span>" : '';
+        return "<section>
+            <h2>Theme Files to Update <span style=\"font-size:0.6em;font-weight:400;color:#6b7280\">" . count($overrides) . " files</span>{$safeNote}</h2>
+            {$filterBtns}
+            <div style=\"overflow-x:auto\">
+            <table id=\"override-table\">
+                <thead><tr><th>Your Theme File</th><th>Upstream Package</th><th>Upstream File</th><th>Change</th><th>Impact</th></tr></thead>
+                <tbody>{$rows}</tbody>
+            </table>
+            </div>
+            <script>
+            function filterOverrides(impact) {
+                document.querySelectorAll('#override-table tbody tr').forEach(function(tr) {
+                    tr.style.display = (impact === 'all' || tr.dataset.impact === impact) ? '' : 'none';
+                });
+            }
+            </script>
+        </section>";
+    }
+
+    private function renderOverrideDiffs(array $overrides): string
+    {
+        $blocks = '';
+
+        foreach ($overrides as $o) {
+            $diff = DiffHelper::generate($o);
+            if ($diff === null) {
+                continue;
+            }
+
+            $classification = DiffHelper::classify($diff);
+            $impactColor    = self::RISK_COLORS[strtolower($o['impact'])] ?? '#6b7280';
+            $label          = $this->h(strtoupper($o['impact']));
+            $file           = $this->h($o['override_file']);
+
+            $diffHtml = '';
+            foreach (explode("\n", rtrim($diff)) as $line) {
+                if (str_starts_with($line, '---') || str_starts_with($line, '+++')) {
+                    $diffHtml .= '<span style="color:#6b7280">' . $this->h($line) . '</span>' . "\n";
+                } elseif (str_starts_with($line, '@@')) {
+                    $diffHtml .= '<span style="color:#2563eb;font-weight:600">' . $this->h($line) . '</span>' . "\n";
+                } elseif (str_starts_with($line, '+')) {
+                    $diffHtml .= '<span style="background:#dcfce7;color:#166534;display:block">' . $this->h($line) . '</span>';
+                } elseif (str_starts_with($line, '-')) {
+                    $diffHtml .= '<span style="background:#fee2e2;color:#991b1b;display:block">' . $this->h($line) . '</span>';
+                } else {
+                    $diffHtml .= '<span style="color:#374151">' . $this->h($line) . '</span>' . "\n";
+                }
+            }
+
+            $blocks .= "<details open style=\"margin-bottom:12px;border:1px solid #e5e7eb;border-radius:6px;overflow:hidden\">
+                <summary style=\"padding:10px 16px;cursor:pointer;background:#f9fafb;display:flex;align-items:center;gap:10px;user-select:none\">
+                    <span style=\"background:{$impactColor};color:#fff;padding:2px 8px;border-radius:4px;font-size:0.75em;white-space:nowrap\">{$label}</span>
+                    <code style=\"font-size:0.85em;color:#374151\">{$file}</code>
+                    <span style=\"margin-left:auto;font-size:0.8em;color:#6b7280\">{$this->h($classification)}</span>
+                </summary>
+                <pre style=\"margin:0;padding:12px 16px;overflow-x:auto;font-size:0.8em;line-height:1.5;background:#fff;border-top:1px solid #e5e7eb\">{$diffHtml}</pre>
+            </details>";
+        }
+
+        if ($blocks === '') {
+            return '';
+        }
+
+        return "<section>
+            <h2>File Diffs — Action Required</h2>
+            <p style=\"color:#6b7280;font-size:0.9em;margin-top:-8px\">
+                <span style=\"background:#fee2e2;padding:0 4px\">red</span> = upstream (new version) &nbsp;
+                <span style=\"background:#dcfce7;padding:0 4px\">green</span> = your theme override &nbsp;
+                <button onclick=\"document.querySelectorAll('#diff-section details').forEach(d=>d.open=false)\" style=\"padding:2px 10px;border:1px solid #d1d5db;border-radius:4px;cursor:pointer;background:#f3f4f6;font-size:0.9em\">Collapse all</button>
+                <button onclick=\"document.querySelectorAll('#diff-section details').forEach(d=>d.open=true)\" style=\"padding:2px 10px;border:1px solid #d1d5db;border-radius:4px;cursor:pointer;background:#f3f4f6;font-size:0.9em\">Expand all</button>
+            </p>
+            <div id=\"diff-section\">{$blocks}</div>
+        </section>";
+    }
+
+    private function renderPackageTable(array $data): string
+    {
+        $allPkgs = array_unique(array_merge(array_keys($data['old_packages']), array_keys($data['new_packages'])));
+        $rows = '';
+        foreach ($allPkgs as $pkg) {
+            $oldVer = $this->h($data['old_packages'][$pkg]['version'] ?? '—');
+            $newVer = $this->h($data['new_packages'][$pkg]['version'] ?? '—');
+            $added = $modified = $deleted = 0;
+            foreach ($data['changes'][$pkg] ?? [] as $c) {
+                match ($c['change_type']) { 'added' => $added++, 'modified' => $modified++, 'deleted' => $deleted++, default => null };
+            }
+            $hasChanges = ($added + $modified + $deleted) > 0;
+            $bg = $hasChanges ? '' : 'style="color:#9ca3af"';
+            $rows .= "<tr {$bg}><td style=\"font-family:monospace;font-size:0.85em\">{$this->h($pkg)}</td>
+                <td>{$oldVer}</td><td>{$newVer}</td>
+                <td style=\"color:#2563eb\">{$added}</td>
+                <td style=\"color:#d97706\">{$modified}</td>
+                <td style=\"color:#dc2626\">{$deleted}</td></tr>\n";
+        }
+        return "<section><h2>Package Version Changes</h2><div style=\"overflow-x:auto\">
+            <table><thead><tr><th>Package</th><th>Before</th><th>After</th><th>+Added</th><th>~Modified</th><th>-Deleted</th></tr></thead>
+            <tbody>{$rows}</tbody></table></div></section>";
+    }
+
+    private function renderChangeTable(array $data): string
+    {
+        $allChanges = [];
+        foreach ($data['changes'] as $pkgName => $pkgChanges) {
+            foreach ($pkgChanges as $relPath => $change) {
+                $allChanges[] = ['pkg' => basename($pkgName), 'path' => $relPath, 'change' => $change];
+            }
+        }
+        if (empty($allChanges)) {
+            return '<section><h2>Change List</h2><p><em>No changes detected.</em></p></section>';
+        }
+
+        usort($allChanges, function ($a, $b) {
+            $order = ['critical' => 4, 'high' => 3, 'medium' => 2, 'low' => 1];
+            return ($order[$b['change']['risk'] ?? 'low'] ?? 0) <=> ($order[$a['change']['risk'] ?? 'low'] ?? 0);
+        });
+
+        $rows = '';
+        foreach ($allChanges as $c) {
+            $ch   = $c['change'];
+            $risk = $ch['risk'] ?? 'low';
+            $rows .= "<tr>
+                <td style=\"font-family:monospace;font-size:0.8em\">{$this->h($c['pkg'])}</td>
+                <td style=\"font-family:monospace;font-size:0.8em\">{$this->h($c['path'])}</td>
+                <td>{$this->badge($ch['change_type'])}</td>
+                <td>{$this->h($ch['category'])}</td>
+                <td>{$this->badge($risk)}</td>
+            </tr>\n";
+        }
+
+        return "<section><h2>Consolidated Change List</h2><div style=\"overflow-x:auto\">
+            <table><thead><tr><th>Package</th><th>File</th><th>Change</th><th>Category</th><th>Risk</th></tr></thead>
+            <tbody>{$rows}</tbody></table></div></section>";
+    }
+
+    private function renderCriticalDetail(array $data): string
+    {
+        $items = [];
+        foreach ($data['changes'] as $pkgName => $pkgChanges) {
+            foreach ($pkgChanges as $relPath => $change) {
+                $risk = $change['risk'] ?? 'low';
+                if (!in_array($risk, ['critical', 'high'], true)) {
+                    continue;
+                }
+                $override = null;
+                foreach ($data['overrides'] as $o) {
+                    if ($o['upstream_file'] === $relPath && $o['upstream_pkg'] === $pkgName) {
+                        $override = $o;
+                        break;
+                    }
+                }
+                $items[] = compact('risk', 'pkgName', 'relPath', 'change', 'override');
+            }
+        }
+
+        if (empty($items)) {
+            return '';
+        }
+
+        usort($items, fn($a, $b) => ($b['risk'] === 'critical' ? 1 : 0) <=> ($a['risk'] === 'critical' ? 1 : 0));
+
+        $html = '<section><h2>Critical Issues (Must Fix)</h2>';
+        foreach ($items as $item) {
+            $risk   = strtoupper($item['risk']);
+            $change = $item['change'];
+            $color  = self::RISK_COLORS[$item['risk']] ?? '#6b7280';
+            $html  .= "<div style=\"border-left:4px solid {$color};padding:12px 16px;margin-bottom:16px;background:#fff;border-radius:0 6px 6px 0\">
+                <div style=\"font-weight:700;color:{$color};margin-bottom:6px\">{$risk}: <code>{$this->h($item['relPath'])}</code> in <code>{$this->h($item['pkgName'])}</code></div>
+                <ul style=\"margin:0;padding-left:20px;line-height:1.8\">";
+            $html .= "<li><strong>Change:</strong> {$this->h($change['change_type'])} ({$this->h($change['version_before'])} → {$this->h($change['version_after'])})</li>";
+            if ($change['has_alpine_before'] || $change['has_alpine_after']) {
+                $alpineNote = $change['has_alpine_before'] && $change['has_alpine_after']
+                    ? 'Alpine.js patterns present in both versions — reactive behavior may have changed'
+                    : ($change['has_alpine_after'] ? 'Alpine.js patterns added' : 'Alpine.js patterns removed');
+                $html .= "<li><strong>Alpine.js:</strong> {$this->h($alpineNote)}</li>";
+            }
+            if ($item['override']) {
+                $html .= "<li><strong>Your override:</strong> <code>{$this->h($item['override']['override_file'])}</code></li>";
+                $html .= "<li><strong>Impact:</strong> {$this->badge($item['override']['impact'])}</li>";
+                $html .= "<li><strong>Action:</strong> Diff your override against the new upstream file and merge changes.</li>";
+            } else {
+                $html .= "<li><em>No direct override — this change may still affect behavior inherited by your theme.</em></li>";
+            }
+            $html .= "</ul></div>";
+        }
+        $html .= '</section>';
+        return $html;
+    }
+
+    private function renderCrossModuleTable(array $risks): string
+    {
+        $html = '<section><h2>Cross-Module Interaction Risks</h2>';
+        if (empty($risks)) {
+            return $html . '<p><em>No cross-module Alpine store interaction risks detected.</em></p></section>';
+        }
+
+        $rows = '';
+        foreach ($risks as $r) {
+            $rows .= "<tr>
+                <td><code>{$this->h($r['store'])}</code></td>
+                <td>{$this->badge($r['store_status'])}</td>
+                <td style=\"font-family:monospace;font-size:0.8em\">{$this->h(basename($r['changed_in_pkg']))}</td>
+                <td style=\"font-family:monospace;font-size:0.8em\">{$this->h($r['changed_in_file'])}</td>
+                <td style=\"font-family:monospace;font-size:0.8em\">{$this->h(basename($r['affected_pkg']))}</td>
+                <td style=\"font-family:monospace;font-size:0.8em\">{$this->h($r['affected_file'])}</td>
+            </tr>\n";
+        }
+
+        return $html . "<div style=\"overflow-x:auto\"><table>
+            <thead><tr><th>Store</th><th>Status</th><th>Changed In</th><th>Changed File</th><th>Affected Pkg</th><th>Affected File</th></tr></thead>
+            <tbody>{$rows}</tbody></table></div></section>";
+    }
+
+    private function wrap(string $body, string $generatedAt, string $snapshotAt): string
+    {
+        return <<<HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hyvä Upgrade Impact Report</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f9fafb; color: #111827; margin: 0; padding: 24px; }
+  .container { max-width: 1400px; margin: 0 auto; }
+  header { margin-bottom: 32px; }
+  header h1 { margin: 0 0 4px; font-size: 1.6em; }
+  header p { margin: 0; color: #6b7280; font-size: 0.9em; }
+  section { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 24px; margin-bottom: 24px; }
+  h2 { margin: 0 0 16px; font-size: 1.1em; color: #1f2937; border-bottom: 1px solid #f3f4f6; padding-bottom: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
+  th { background: #f3f4f6; text-align: left; padding: 8px 12px; font-weight: 600; color: #374151; white-space: nowrap; }
+  td { padding: 7px 12px; border-bottom: 1px solid #f3f4f6; vertical-align: top; word-break: break-word; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #f9fafb; }
+  code { background: #f3f4f6; padding: 1px 5px; border-radius: 3px; font-size: 0.9em; }
+  button:hover { background: #e5e7eb !important; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>Hyvä Upgrade Impact Report</h1>
+    <p>Generated: {$generatedAt} &nbsp;|&nbsp; Snapshot: {$snapshotAt}</p>
+  </header>
+  {$body}
+</div>
+</body>
+</html>
+HTML;
     }
 }
 
